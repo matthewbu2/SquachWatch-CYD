@@ -4,6 +4,11 @@
 #if defined(WAVESHARE_206)
 #include "phone_gps.h"
 #endif
+#if defined(WAVESHARE_206)
+#include <esp_wifi.h>
+static wifi_promiscuous_cb_t s_promiscCb = nullptr;   // see bleUp()
+static bool s_wifiDown = false;                       // see bleDown()
+#endif
 #include "wifi_auth.h"
 #include "serial_flush.h"
 #include "signatures.h"
@@ -799,7 +804,12 @@ bool DetectionEngine::init() {
     wifi_promiscuous_filter_t filter;
     filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
     esp_wifi_set_promiscuous_filter(&filter);
+#if defined(WAVESHARE_206)
+    // Kept for bleUp(), after bleDown() took the driver down.
+    s_promiscCb = [](void* buf, wifi_promiscuous_pkt_type_t) {
+#else
     esp_wifi_set_promiscuous_rx_cb([](void* buf, wifi_promiscuous_pkt_type_t) {
+#endif
         s_wifiRaw++;
         if (!g_engine) return;
         const wifi_promiscuous_pkt_t* pkt = (const wifi_promiscuous_pkt_t*)buf;
@@ -899,7 +909,12 @@ bool DetectionEngine::init() {
             for (int i = 4; i < 10; i++) if (frame[i] != 0xFF) { bcast = false; break; }
             g_engine->postDeauth(frame + 10, pkt->rx_ctrl.rssi, pkt->rx_ctrl.channel, bcast);
         }
+#if defined(WAVESHARE_206)
+    };
+    esp_wifi_set_promiscuous_rx_cb(s_promiscCb);
+#else
     });
+#endif
 
     // 3. NimBLE scan — onResult() fires live per-advertisement via
     // g_bleScanCallbacks (see above), not via a scan-complete callback
@@ -1980,7 +1995,14 @@ static void updScanStartOnHost(struct ble_npl_event*) {
     if (g_rawMode == RawScanMode::NONE && scan && !scan->isScanning()) scan->start(0, false, false);
 }
 
+#if defined(WAVESHARE_206)
+static bool s_bleDown = false;   // see bleDown()
+#endif
+
 void DetectionEngine::startUpdateRadio() {
+#if defined(WAVESHARE_206)
+    bleUp();   // an update needs Bluetooth, and posts to its queue below
+#endif
     if (!s_updEvReady) {
         ble_npl_event_init(&s_updStopEv,  updScanStopOnHost,  nullptr);
         ble_npl_event_init(&s_updStartEv, updScanStartOnHost, nullptr);
@@ -2030,6 +2052,9 @@ bool DetectionEngine::restRadios(bool bleToo) {
 
 void DetectionEngine::wakeRadios() {
     if (g_rawMode != RawScanMode::REST) return;
+#if defined(WAVESHARE_206)
+    bleUp();
+#endif
     g_rawMode = RawScanMode::NONE;
     esp_wifi_start();
     esp_wifi_set_promiscuous(true);
@@ -2045,6 +2070,54 @@ void DetectionEngine::wakeRadios() {
 }
 
 bool DetectionEngine::radiosResting() { return g_rawMode == RawScanMode::REST; }
+
+#if defined(WAVESHARE_206)
+bool DetectionEngine::bleDown() {
+    if (s_bleDown) return true;
+    // Not with the phone's GPS service registered: a GATT server does not
+    // come back by itself from a host restart.
+    if (g_rawMode != RawScanMode::REST || !g_restBle || PhoneGps::registered()) return false;
+    NimBLEDevice::deinit(false);   // false: the scan object and its settings stay for bleUp()
+    s_bleDown = !NimBLEDevice::isInitialized();
+    Serial.printf("[radio] Bluetooth %s\n", s_bleDown ? "shut down" : "did not shut down");
+    // The WiFi driver too: stopped, it still holds its clocks and tasks.
+    // Through the core's own WIFI_OFF, so a later WiFi.mode() (an update,
+    // the OTA screen) finds it in the state it expects.
+    if (s_bleDown && !s_wifiDown) {
+        s_wifiDown = WiFi.mode(WIFI_OFF);
+        Serial.printf("[radio] WiFi driver %s\n", s_wifiDown ? "deinitialised" : "did not deinitialise");
+    }
+    return s_bleDown;
+}
+
+void DetectionEngine::bleUp() {
+    if (s_wifiDown) {
+        // Back the way begin() brought it up; wakeRadios() starts the
+        // sniffer on it. Minutes after the teardown, so the S3's
+        // deinit-then-init race (see begin()) has long settled.
+        s_wifiDown = false;
+        WiFi.mode(WIFI_STA);
+        WiFi.disconnect();
+        wifi_promiscuous_filter_t filter;
+        filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+        esp_wifi_set_promiscuous_filter(&filter);
+        if (s_promiscCb) esp_wifi_set_promiscuous_rx_cb(s_promiscCb);
+        if (radiosResting()) esp_wifi_stop();   // wakeRadios() starts it
+        Serial.println("[radio] WiFi driver back up");
+    }
+    if (!s_bleDown) return;
+    NimBLEDevice::init("");
+    // A scan start before the host has synced with the controller fails,
+    // and wakeRadios() starts one straight after this.
+    const uint32_t t0 = millis();
+    while (!ble_hs_synced() && millis() - t0 < 1500) delay(10);
+    s_bleDown = false;
+    Serial.printf("[radio] Bluetooth back up (%s, %lu ms)\n", ble_hs_synced() ? "synced" : "NOT synced",
+                  (unsigned long)(millis() - t0));
+}
+
+bool DetectionEngine::bleIsDown() { return s_bleDown; }
+#endif
 
 void DetectionEngine::watchBle(const uint8_t* mac, const char* name) {
     _watchKind = WatchKind::BLE;

@@ -3701,7 +3701,7 @@ static void wsBandsTick(uint32_t now) {
     // Wardriving: how many rows are on the card, between the date and the battery.
     char wd[16] = "";
     if (Settings::scanningOff()) {
-        snprintf(wd, sizeof wd, "RADIOS OFF");
+        snprintf(wd, sizeof wd, "RF OFF");
     } else if (Wardrive::enabled()) {
         const uint8_t st = Wardrive::wsState();
         if (st == 3)      snprintf(wd, sizeof wd, "WD %lu", (unsigned long)Wardrive::written());
@@ -3728,8 +3728,17 @@ static void wsBandsTick(uint32_t now) {
     s_band->fillSprite(TFT_BLACK);
     const uint16_t battCol = !haveBatt ? (uint16_t)TFT_DARKGREY : chg ? (uint16_t)Theme::CYAN
                            : pct >= 40 ? (uint16_t)TFT_GREEN : pct >= 20 ? (uint16_t)TFT_YELLOW : (uint16_t)TFT_RED;
-    const int16_t gap = 18;
+    // The glass's rounded corners hide the band's ends, so the line has to
+    // fit well inside BAND_W: tighter gaps first, then the smaller font,
+    // rather than the battery sliding off the edge.
+    static const int16_t BAND_FIT_W = 330;
+    int16_t gap = 18;
     s_band->setFreeFont(&FreeSansBold9pt7b);   // a size up from font 2, for the wrist
+    auto lineW = [&]() -> int16_t {
+        return s_band->textWidth(date) + gap + (wd[0] ? s_band->textWidth(wd) + gap : 0) + s_band->textWidth(batt);
+    };
+    if (lineW() > BAND_FIT_W) gap = 10;
+    if (lineW() > BAND_FIT_W) { s_band->setFreeFont(nullptr); s_band->setTextFont(2); }
     const int16_t wD = s_band->textWidth(date), wB = s_band->textWidth(batt);
     const int16_t wW = wd[0] ? (int16_t)(s_band->textWidth(wd) + gap) : 0;
     const int16_t x0 = (BAND_W - (wD + gap + wW + wB)) / 2;
@@ -3845,6 +3854,9 @@ static void twatchApplySteady() {
     s_pmu.settDC1WorkModeToPwm(0);
 }
 
+#if defined(WAVESHARE_206)
+static uint32_t s_napCount = 0, s_napUs = 0;   // see twatchNap()
+#endif
 static void twatchBatterySample(uint8_t why) {
     if (!s_pmuOk) return;
     BlackBox::BattRecord r;
@@ -3861,6 +3873,16 @@ static void twatchBatterySample(uint8_t why) {
     if (!s_radiosResting)   r.flags |= BlackBox::BATT_RADIOS_ON;
     r.chipC   = (int8_t)twatchChipC();
     r.steady  = 0;
+#if defined(WAVESHARE_206)
+    // No STEADY POWER here, so the column carries the share of the time
+    // since the last sample spent in a light-sleep NAP, in percent.
+    {
+        static uint32_t lastMs = 0, lastNapUs = 0;
+        const uint32_t ms = millis(), el = ms - lastMs;
+        if (lastMs && el) r.steady = (uint8_t)min<uint32_t>(100, (s_napUs - lastNapUs) / 10u / el);
+        lastMs = ms; lastNapUs = s_napUs;
+    }
+#endif
     r.adverts = advertsSeen();
     r.frames  = wifiFramesSeen();
     BlackBox::noteBattery(r);
@@ -3871,6 +3893,58 @@ static void twatchBatterySample(uint8_t why) {
                   (unsigned)getCpuFrequencyMhz(), (unsigned long)r.upSec, (int)r.chipC,
                   (unsigned long)r.adverts, (unsigned long)r.frames, WHY[why < 6 ? why : 0]);
 }
+
+#if defined(WAVESHARE_206)
+// NAP: the dark watch's idle time in light sleep instead of delay(). delay()
+// parks the core but leaves the clocks, flash and PSRAM running -- a light
+// sleep stops them, between loop passes that come four times a second
+// (the crown's press is latched in the PMU, which the next pass reads; its
+// IRQ line goes to an expander, not to a GPIO that could wake us). Only on
+// battery -- a light sleep takes the USB console away -- and only with
+// Bluetooth shut down and WiFi stopped (SCANNING OFF): the radios cannot
+// sleep under us. A touch wakes it at once through TP_INT (GPIO38, low
+// while touched); the timer covers the rest.
+static bool twatchNapOk() {
+    return s_pmuOk && !s_onUsb && engine.bleIsDown() && engine.radiosResting() &&
+           state != AppState::UPDATE && OtaWifi::state() == OtaWifi::State::OFF;
+}
+
+static void twatchNap(uint32_t us) {
+    if (us < 5000) { delay(us / 1000); return; }   // not worth the trip
+    esp_sleep_enable_timer_wakeup(us);
+    const bool touchWake = gpio_get_level(GPIO_NUM_38) == 1;   // already low: the timer only
+    if (touchWake) { gpio_wakeup_enable(GPIO_NUM_38, GPIO_INTR_LOW_LEVEL); esp_sleep_enable_gpio_wakeup(); }
+    const int64_t t0 = esp_timer_get_time();
+    esp_light_sleep_start();
+    s_napUs += (uint32_t)(esp_timer_get_time() - t0);
+    s_napCount++;
+    if (touchWake) { gpio_wakeup_disable(GPIO_NUM_38); esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO); }
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+}
+
+// Through a light sleep the system clock runs on the chip's internal RC
+// oscillator (this core has no 32 kHz crystal option), a few percent off
+// and moving with temperature: a napping night ran a couple of minutes
+// fast (2026-10-20). The PCF85063 keeps crystal time, so after any nap the
+// system clock is set back to it -- every minute while dark, and at once
+// when the screen wakes, so the face never shows the drift. Straight to
+// settimeofday: Clock::setEpoch() would write the NVS note every time.
+static void twatchRtcResync(uint32_t now) {
+    static uint32_t at = 0, napsAt = 0;
+    static bool wasAsleep = false;
+    const bool woke = wasAsleep && !s_panelAsleep;
+    wasAsleep = s_panelAsleep;
+    if (s_napCount == napsAt || (!woke && now - at < 60000)) return;
+    at = now; napsAt = s_napCount;
+    const uint32_t t = rtcRead();
+    if (!t || !Clock::trusted()) return;
+    const int32_t d = (int32_t)(Clock::nowEpoch() - t);
+    if (d > -2 && d < 2) return;
+    struct timeval tv = { (time_t)t, 0 };
+    settimeofday(&tv, nullptr);
+    Serial.printf("[rtc] napping clock off by %+ld s, set back to the chip\n", (long)d);
+}
+#endif
 
 // Every ten minutes, at boot, and whenever the cable or the screen changes
 // state: the points where the slope of the curve changes.
@@ -3901,6 +3975,9 @@ static void twatchBatteryTick(uint32_t now) {
 // has the radio (an update, a raw scan). Otherwise they run for the on part
 // of the cycle and rest for the rest of it. What "rest" means is the
 // engine's business: see DetectionEngine::restRadios().
+#if defined(WAVESHARE_206)
+static uint32_t s_offRestartAt = 0;   // see the SCANNING OFF block below
+#endif
 static void twatchRadioTick(uint32_t now) {
     static uint32_t phaseAt = 0, usbAt = 0;
     static bool     usb = true;
@@ -3915,7 +3992,8 @@ static void twatchRadioTick(uint32_t now) {
     // screen on or off, cable or not. A raw scan screen or an update still
     // gets the radio while it is open; leaving it puts them back to rest.
     {
-        static bool offApplied = false;
+        static bool offApplied = false, downTried = false;
+        static uint32_t offAt = 0;
         const bool off = Settings::scanningOff() && !onRawScanScreen() &&
                          state != AppState::UPDATE && OtaWifi::state() == OtaWifi::State::OFF;
         if (off) {
@@ -3923,15 +4001,35 @@ static void twatchRadioTick(uint32_t now) {
                 // A duty-cycle rest may have left Bluetooth listening: wake, then rest both.
                 if (s_radiosResting) { engine.wakeRadios(); s_radiosResting = false; }
                 if (engine.restRadios(true)) {
-                    s_radiosResting = true; offApplied = true;
+                    s_radiosResting = true; offApplied = true; offAt = now; downTried = false;
                     Serial.println("[radio] SCANNING OFF: WiFi and Bluetooth off, just a watch");
                 }
+            } else if (!downTried && now - offAt >= 2000) {
+                // Then the Bluetooth stack itself, once the scan stop posted
+                // above has had its turn: stopping scans alone leaves the
+                // controller, and the radio with it, powered.
+                downTried = true;
+                if (!engine.bleDown() && PhoneGps::registered()) {
+                    // WARDRIVE registered the phone's GPS service this boot, and
+                    // the library cannot bring a GATT server back from a stack
+                    // restart -- so the stack stays up, and the watch burns most
+                    // of its cell on it (2026-10-18). A restart comes back with
+                    // SCANNING OFF saved and no service, and shuts it down then.
+                    s_offRestartAt = now + 2500;
+                    if (!s_offRestartAt) s_offRestartAt = 1;
+                    Theme::showToast("RESTARTING", "To switch Bluetooth fully off", Theme::CYAN, 2500);
+                    Serial.println("[radio] the phone GPS service holds Bluetooth up: restarting to switch it off");
+                }
+            } else if (s_offRestartAt && (int32_t)(now - s_offRestartAt) >= 0) {
+                ESP.restart();
             }
             phaseAt = now; owedMs = 0;
             return;
         }
         if (offApplied) {
             offApplied = false;
+            s_offRestartAt = 0;
+            engine.bleUp();
             if (s_radiosResting) { engine.wakeRadios(); s_radiosResting = false; }
             phaseAt = now;
             Serial.println("[radio] SCANNING ON");
@@ -6145,6 +6243,9 @@ void loop() {
     twatchRadioTick(now);
     twatchRadioHealTick(now);
     twatchBatteryTick(now);
+#if defined(WAVESHARE_206)
+    twatchRtcResync(now);
+#endif
     if (g_consoleBatt) { g_consoleBatt = false; twatchBatterySample(BlackBox::BATT_WHY_TIMER); }
     if (g_consoleBattLog) {
         g_consoleBattLog = false;
@@ -9632,8 +9733,17 @@ void loop() {
         const bool alerting = (state == AppState::ALERT || state == AppState::WATCH_ALERT);
         const uint16_t timeoutSec = Settings::screenTimeoutSec();
         // Desk mode is a clock; a clock that goes dark is not there.
+#if defined(WAVESHARE_206)
+        // ...except on the wrist, where desk mode is the watch face: it times
+        // out on battery like any other screen (the cable still keeps it lit,
+        // below), and a tap or the crown brings it straight back. Held lit, it
+        // ran a full 400 mAh cell flat in 2.5 h (2026-10-18).
+        bool wantDim = timeoutSec && idleMs > (uint32_t)timeoutSec * 1000UL &&
+                       !(Settings::wakeOnAlert() && alerting);
+#else
         bool wantDim = timeoutSec && idleMs > (uint32_t)timeoutSec * 1000UL &&
                        !(Settings::wakeOnAlert() && alerting) && state != AppState::DESK;
+#endif
 #if defined(TWATCH_S3)
         // On the cable the watch stays lit; on battery the timeout always runs
         // (see Settings::screenTimeoutSec), unless it is set to NEVER.
@@ -9695,6 +9805,15 @@ void loop() {
         // ten passes a second is plenty, and the rest of the time is idle.
         if (s_panelAsleep) {
             const uint32_t spentUs = micros() - frameStartUs;
+#if defined(WAVESHARE_206)
+            // Napping, four passes a second: a pass still draws the frame
+            // nobody sees (about 25 ms at 80 MHz), which at ten a second was
+            // a quarter of the night awake (BATTLOG, 2026-10-19). A touch
+            // wakes it at once; the crown's press waits in the PMU, and the
+            // motion sample runs at 2 Hz anyway.
+            if (twatchNapOk()) { if (spentUs < 250000UL) twatchNap(250000UL - spentUs); }
+            else
+#endif
             if (spentUs < 100000UL) delay((100000UL - spentUs) / 1000UL);
         }
 #endif

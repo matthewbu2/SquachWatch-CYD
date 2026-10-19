@@ -217,6 +217,17 @@ static bool codecInit() {
     return true;
 }
 
+#if defined(WAVESHARE_206)
+// Standby between sounds. Powered up and idle, with its clocks stopped, the
+// codec still drew about 30 mA (measured on the bench by the cell's voltage
+// sag, 2026-10-19: a third of the dark watch's night) -- so it sleeps, and the
+// player wakes it with the clocks running and the amp still off. From the
+// player's task: Wire takes its lock per transaction, so the loop's touch
+// and PMU reads only wait their turn.
+static void codecStandby() { wr(0x0E, 0xFF); wr(0x12, 0x02); wr(0x14, 0x00); wr(0x0D, 0xFC); }
+static void codecWake()    { wr(0x0D, 0x01); wr(0x0E, 0x02); wr(0x12, 0x00); wr(0x14, 0x1A); }
+#endif
+
 // ---- the amplifier ---------------------------------------------------------
 static void amp(bool on) { if (PIN_AMP >= 0) digitalWrite(PIN_AMP, (on == s_ampLow) ? LOW : HIGH); }
 
@@ -426,6 +437,10 @@ static void playNow(Id id) {
     int16_t buf[CHUNK * 2];
 
     i2s_start(PORT);
+#if defined(WAVESHARE_206)
+    codecWake();
+    silence(buf, 40);         // the reference and bias settle, the amp still off
+#endif
     silence(buf, 24);         // clocks and zeros before the amp wakes: no pop
     amp(true);
     silence(buf, 16);
@@ -445,6 +460,9 @@ static void playNow(Id id) {
     silence(buf, 16);
     amp(false);
     silence(buf, 24);         // let the DMA drain before the clocks stop
+#if defined(WAVESHARE_206)
+    codecStandby();
+#endif
     i2s_zero_dma_buffer(PORT);
     i2s_stop(PORT);
 }
@@ -500,6 +518,9 @@ void begin() {
 #else
     const bool ok = codecInit();
     const uint8_t id1 = rd(0xFD), id2 = rd(0xFE);
+#if defined(WAVESHARE_206)
+    if (ok) codecStandby();
+#endif
     i2s_stop(PORT);
     if (!ok) { Serial.println("[sound] ES8311 setup failed"); return; }
     s_q = xQueueCreate(4, sizeof(uint8_t));

@@ -294,6 +294,17 @@ public:
     bool     restRadios(bool bleToo);
     void     wakeRadios();
     bool     radiosResting();
+#if defined(WAVESHARE_206)
+    // SCANNING OFF: the Bluetooth stack and controller shut down outright,
+    // and back. An enabled controller keeps the radio powered whether or not
+    // anything scans or advertises -- 60 to 100 mA, most of the watch's
+    // draw with the screen off (measured on the bench, 2026-10-18).
+    // bleDown() only from a rest that took Bluetooth with it; bleUp()
+    // before wakeRadios().
+    bool     bleDown();
+    void     bleUp();
+    bool     bleIsDown();
+#endif
 
     // ---- Watched target ("stalker tracker") --------------------------
     // Session-only (not persisted to NVS -- resets on reboot). One
