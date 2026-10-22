@@ -3897,7 +3897,7 @@ static void twatchBatterySample(uint8_t why) {
 #if defined(WAVESHARE_206)
 // NAP: the dark watch's idle time in light sleep instead of delay(). delay()
 // parks the core but leaves the clocks, flash and PSRAM running -- a light
-// sleep stops them, between loop passes that come four times a second
+// sleep stops them, between loop passes that come twice a second
 // (the crown's press is latched in the PMU, which the next pass reads; its
 // IRQ line goes to an expander, not to a GPIO that could wake us). Only on
 // battery -- a light sleep takes the USB console away -- and only with
@@ -6911,6 +6911,20 @@ void loop() {
         if (odd) extPush();             // 46 ms a push: every other frame
     }
 #endif
+#if defined(WAVESHARE_206)
+    // Napping dark, the screen's drawing was nearly all of each pass (about
+    // 25 ms at 80 MHz, most of the tenth of the night spent awake), for a
+    // frame that is never pushed. With the radios down nothing can be caught
+    // either, so the screen is only drawn once every five seconds then, to
+    // let whatever its state keeps ticking along; the wake draws it at once.
+    bool wsDrawSkip = false;
+    {
+        static uint32_t drawnAt = 0;
+        if (s_panelAsleep && twatchNapOk() && now - drawnAt < 5000) wsDrawSkip = true;
+        else drawnAt = now;
+    }
+    if (!wsDrawSkip)
+#endif
     switch (state) {
         case AppState::BOOT: {
 #if defined(CYD35)
@@ -9656,7 +9670,11 @@ void loop() {
     // straight at tft and every draw this frame already landed on the
     // real screen -- pushing `frame` here would just paint stale data
     // from the sprite we stopped using back over the top of it.
+#if defined(WAVESHARE_206)
+    if (frameBufferOk && !wsDrawSkip) {
+#else
     if (frameBufferOk) {
+#endif
         if (now - transitionStart < TRANSITION_MS) {
             Theme::drawTransitionGlitch(frame, now - transitionStart, TRANSITION_MS);
         }
@@ -9806,12 +9824,12 @@ void loop() {
         if (s_panelAsleep) {
             const uint32_t spentUs = micros() - frameStartUs;
 #if defined(WAVESHARE_206)
-            // Napping, four passes a second: a pass still draws the frame
-            // nobody sees (about 25 ms at 80 MHz), which at ten a second was
-            // a quarter of the night awake (BATTLOG, 2026-10-19). A touch
-            // wakes it at once; the crown's press waits in the PMU, and the
-            // motion sample runs at 2 Hz anyway.
-            if (twatchNapOk()) { if (spentUs < 250000UL) twatchNap(250000UL - spentUs); }
+            // Napping, two passes a second, most of them without drawing
+            // (see wsDrawSkip): ten a second was a quarter of the night
+            // awake (BATTLOG, 2026-10-19), four a tenth. A touch wakes it at
+            // once; the crown's press waits in the PMU for at most half a
+            // second, and the motion sample runs at 2 Hz anyway.
+            if (twatchNapOk()) { if (spentUs < 500000UL) twatchNap(500000UL - spentUs); }
             else
 #endif
             if (spentUs < 100000UL) delay((100000UL - spentUs) / 1000UL);
